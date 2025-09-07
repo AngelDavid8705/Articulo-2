@@ -1,0 +1,193 @@
+---
+title: "Proyecto final"
+format:
+  html:
+    toc: true
+    html-math-method: katex
+    embed-resources: true
+    self-contained-math: true
+    df-print: kable
+editor: source
+execute:
+  warning: false
+  message: false
+---
+
+```{r}
+# Redes bayesianas gaussianas
+library(tidyverse)
+library(bnlearn)
+library(Rgraphviz)
+
+norm_name  <- function(x) x |> iconv(from = "", to = "ASCII//TRANSLIT") |> toupper() |> trimws()
+strip_code <- function(x) gsub("^\\s*\\d{1,3}\\s+", "", x)
+
+# 1) Carga de datos
+socdem   <- read_delim("~/Desktop/Data ensanut/ensanut2022_socdem.csv",
+                       delim = ";", locale = locale(encoding = "LATIN1"),
+                       show_col_types = FALSE)
+muestras <- read_delim("~/Desktop/Data ensanut/ensanut2022_muestras.csv",
+                       delim = ";", locale = locale(encoding = "LATIN1"),
+                       show_col_types = FALSE)
+cal_raw  <- read_csv ("~/Desktop/Data ensanut/calidad_aire_2025.csv",
+                      show_col_types = FALSE)
+
+# 2) ENSANUT + SEMARNAT + Unión
+soc_sel <- socdem |>
+  transmute(
+    FOLIO_I, FOLIO_INT,
+    entidad_nom   = norm_name(desc_ent1),
+    municipio_nom = norm_name(desc_mun1),
+    sexo = factor(h0302, levels = c(1,2), labels = c("Hombre","Mujer")),
+    edad = suppressWarnings(as.numeric(h0303))
+  ) |>
+  mutate(
+    entidad_nom   = strip_code(entidad_nom),
+    municipio_nom = strip_code(municipio_nom)
+  )
+bio_sel <- muestras |>
+  transmute(
+    FOLIO_I, FOLIO_INT,
+    GLU   = as.numeric(valor_GLU_SUERO),
+    LDL   = as.numeric(valor_COL_LDL),
+    TRIG  = as.numeric(valor_TRIG),
+    HB1AC = as.numeric(valor_HB1AC),
+    HDL   = as.numeric(valor_COL_HDL)
+  )
+ensanut <- inner_join(soc_sel, bio_sel, by = c("FOLIO_I","FOLIO_INT"))
+
+# SEMARNAT 2025: normalización de nombres
+calidad <- cal_raw |>
+  mutate(
+    entidad_nom   = norm_name(Entidad_federativa),
+    municipio_nom = norm_name(Municipio)
+  ) |>
+  select(entidad_nom, municipio_nom, SO_2, CO, NOx, COV, PM_010, PM_2_5, NH_3)
+
+# Unión simple por NOMBRE de entidad y municipio
+ensanut <- left_join(ensanut, calidad, by = c("entidad_nom","municipio_nom"))
+
+# 3) Dataset final (listas fijas, sin ranking)
+
+poll_keep <- intersect(c("SO_2","NOx","PM_2_5"), names(ensanut))
+
+bio_keep  <- intersect(c("GLU","LDL","TRIG","HB1AC","HDL"), names(ensanut))
+
+df_lin <- ensanut |>
+  select(sexo, edad, all_of(poll_keep), all_of(bio_keep)) |>
+  drop_na()
+
+stopifnot(nrow(df_lin) > 0)
+
+# 4) DAGS
+nodes_all <- unique(c("edad", intersect("sexo", names(df_lin)), poll_keep, bio_keep))
+
+mk_arcs <- function(from, to) {
+  if (length(from) == 0 || length(to) == 0)
+    return(matrix(character(0), ncol = 2, dimnames = list(NULL, c("from","to"))))
+  m <- as.matrix(expand.grid(from = from, to = to, KEEP.OUT.ATTRS = FALSE))
+  colnames(m) <- c("from","to"); m
+}
+arc_filter <- function(A, nodes) {
+  if (is.null(A) || nrow(A) == 0)
+    return(matrix(character(0), ncol=2, dimnames=list(NULL, c("from","to"))))
+  A <- A[A[,1] %in% nodes & A[,2] %in% nodes & A[,1] != A[,2], , drop = FALSE]
+  unique(A)
+}
+
+# DAG1
+arc_set <- rbind(
+  mk_arcs("edad", bio_keep),
+  if ("sexo" %in% nodes_all) mk_arcs("sexo", bio_keep) else NULL,
+  mk_arcs(poll_keep, bio_keep)
+)
+arc_set <- arc_filter(arc_set, nodes_all)
+
+dag1 <- empty.graph(nodes = nodes_all)
+arcs(dag1) <- arc_set
+
+# DAG2
+chain <- if (length(poll_keep) >= 2) {
+  cbind(from = poll_keep[-length(poll_keep)], to = poll_keep[-1])
+} else matrix(character(0), ncol=2, dimnames=list(NULL, c("from","to")))
+main_pol <- if (length(poll_keep) >= 1) poll_keep[1] else character(0)
+
+arc_set <- rbind(
+  chain,
+  mk_arcs(c(main_pol, "sexo", "edad"), bio_keep)
+)
+arc_set <- arc_filter(arc_set, nodes_all)
+
+dag2 <- empty.graph(nodes = nodes_all)
+arcs(dag2) <- arc_set
+
+# DAG3
+arc_set <- rbind(
+  mk_arcs("edad", bio_keep),
+  if (all(c("GLU","HB1AC") %in% nodes_all)) mk_arcs("GLU", "HB1AC") else NULL,
+  if (length(poll_keep) >= 1 && "LDL"  %in% nodes_all) mk_arcs(poll_keep[1], "LDL") else NULL,
+  if (length(poll_keep) >= 2 && "TRIG" %in% nodes_all) mk_arcs(poll_keep[2], "TRIG") else NULL
+)
+arc_set <- arc_filter(arc_set, nodes_all)
+
+dag3 <- empty.graph(nodes = nodes_all)
+arcs(dag3) <- arc_set
+
+# Graficar
+graphviz.plot(dag1, shape="ellipse", layout="dot", main="DAG1")
+graphviz.plot(dag2, shape="ellipse", layout="dot", main="DAG2")
+graphviz.plot(dag3, shape="ellipse", layout="dot", main="DAG3")
+
+
+# 5) Ajuste GBN y BIC/AIC solo nodos numéricos
+dat_g <- df_lin |>
+  dplyr::select(dplyr::all_of(c("edad", poll_keep, bio_keep))) |>
+  dplyr::mutate(dplyr::across(dplyr::everything(), as.numeric))
+
+# Función para alinear deja en el DAG solo los nodos que existen en dat_g
+align_net <- function(net, dat) {
+  nd <- intersect(nodes(net), names(dat))
+  list(net = bnlearn::subgraph(net, nodes = nd),
+       dat = dat[, nd, drop = FALSE])
+}
+
+al1 <- align_net(dag1, dat_g)
+al2 <- align_net(dag2, dat_g)
+al3 <- align_net(dag3, dat_g)
+
+fit1 <- bn.fit(al1$net, data = al1$dat, method = "mle-g")
+fit2 <- bn.fit(al2$net, data = al2$dat, method = "mle-g")
+fit3 <- bn.fit(al3$net, data = al3$dat, method = "mle-g")
+
+scores <- tibble(
+  modelo = c("DAG1","DAG2","DAG3"),
+  BIC_g  = c(score(al1$net, data = al1$dat, type = "bic-g"),
+             score(al2$net, data = al2$dat, type = "bic-g"),
+             score(al3$net, data = al3$dat, type = "bic-g")),
+  AIC_g  = c(score(al1$net, data = al1$dat, type = "aic-g"),
+             score(al2$net, data = al2$dat, type = "aic-g"),
+             score(al3$net, data = al3$dat, type = "aic-g"))
+)
+print(scores)
+
+best_idx  <- which.max(scores$BIC_g)
+best_dag  <- list(al1$net, al2$net, al3$net)[[best_idx]]
+best_fit  <- list(fit1, fit2, fit3)[[best_idx]]
+best_data <- list(al1$dat, al2$dat, al3$dat)[[best_idx]]
+best_name <- scores$modelo[best_idx]
+cat("Mejor estructura (BIC-g):", best_name, "\n")
+
+# 6) Queries
+set.seed(2025)
+
+q1 <- cpquery(best_fit, event = (GLU  > 126), evidence = list(edad = 60), method = "lw", n = 5e4)
+q2 <- cpquery(best_fit, event = (LDL  > 130), evidence = list(edad = 60), method = "lw", n = 5e4)
+q3 <- cpquery(best_fit, event = (TRIG > 150), evidence = list(edad = 60), method = "lw", n = 5e4)
+
+queries <- tibble(
+  query = c("Q1","Q2","Q3"),
+  prob  = c(q1, q2, q3)
+)
+print(queries)
+
+```
