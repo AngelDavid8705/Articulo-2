@@ -1,1 +1,1 @@
-# Articulo-2
+# Articulo 2 - Redes Bayesianas Gaussianas
